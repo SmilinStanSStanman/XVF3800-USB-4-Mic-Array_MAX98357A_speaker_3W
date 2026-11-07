@@ -1,3 +1,14 @@
+# ============================================================
+# reSpeaker XVF3800 + XIAO ESP32-S3
+# Variante de hardware: MAX98357A + altavoz pasivo de 3 W.
+#
+# Ruta de reproducción:
+# Media Player -> resamplers -> mixer -> salida I2S
+# -> MAX98357A externo -> altavoz pasivo.
+#
+# El archivo ok_nabu.flac debe estar junto a este YAML.
+# ============================================================
+
 esphome:
   name: respeaker-xvf3800
   friendly_name: reSpeaker XVF3800
@@ -27,7 +38,11 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
 
-# Control del XVF3800 y del aro de LED.
+# ============================================================
+# Comunicación con el XVF3800.
+# Se utiliza para controlar el aro LED y el silencio del micro.
+# ============================================================
+
 i2c:
   id: xmos_control_bus
   sda: GPIO5
@@ -35,7 +50,17 @@ i2c:
   frequency: 100kHz
   scan: true
 
-# El XVF3800 genera los relojes I2S.
+# ============================================================
+# Interfaces de audio I2S.
+#
+# El XVF3800 proporciona los relojes compartidos:
+# LRCLK: GPIO7
+# BCLK:  GPIO8
+#
+# Se mantienen interfaces separadas para captura y reproducción.
+# El ESP32 trabaja en modo secundario en ambas.
+# ============================================================
+
 i2s_audio:
   - id: i2s_input
     i2s_lrclk_pin:
@@ -53,7 +78,12 @@ i2s_audio:
       number: GPIO8
       allow_other_uses: true
 
+# ============================================================
+# Captura de voz.
+# ============================================================
+
 microphone:
+  # Audio recibido del XVF3800 por GPIO43.
   - platform: i2s_audio
     id: respeaker_mic_raw
     i2s_audio_id: i2s_input
@@ -66,7 +96,8 @@ microphone:
     i2s_mode: secondary
     correct_dc_offset: true
 
-  # Canal derecho, 16 bits y 16 kHz.
+  # Adapta la captura a un canal, 16 bits y 16 kHz.
+  # Esta es la entrada utilizada por Assist y microWakeWord.
   - platform: resampler
     id: respeaker_mic
     microphone:
@@ -75,7 +106,21 @@ microphone:
     bits_per_sample: 16
     sample_rate: 16000
 
+# ============================================================
+# Reproducción.
+#
+# Para la variante MAX98357A:
+# GPIO44 -> DIN del amplificador.
+# GPIO7  -> LRC/LRCLK del amplificador.
+# GPIO8  -> BCLK del amplificador.
+#
+# El altavoz pasivo se conecta a las dos salidas de altavoz
+# del MAX98357A, no directamente al ESP32.
+# ============================================================
+
 speaker:
+  # Salida digital I2S hacia el MAX98357A.
+  # No controla un pin de apagado ni una ganancia física del módulo.
   - platform: i2s_audio
     id: respeaker_speaker
     i2s_audio_id: i2s_output
@@ -85,9 +130,10 @@ speaker:
     sample_rate: 48000
     bits_per_sample: 32bit
     i2s_mode: secondary
-    buffer_duration: 500ms
+    buffer_duration: 1000ms
     timeout: never
 
+  # Combina las rutas de anuncios y música en una salida común.
   - platform: mixer
     id: respeaker_mixer
     output_speaker: respeaker_speaker
@@ -96,15 +142,22 @@ speaker:
       - id: announcement_mixer_input
       - id: media_mixer_input
 
+  # Adapta los anuncios y el tono de activación a 48 kHz.
   - platform: resampler
     id: announcement_speaker
     output_speaker: announcement_mixer_input
     sample_rate: 48000
 
+  # Adapta la música a 48 kHz.
   - platform: resampler
     id: media_speaker
     output_speaker: media_mixer_input
     sample_rate: 48000
+
+# ============================================================
+# Reproductor multimedia.
+# Dos rutas: anuncios y reproducción multimedia.
+# ============================================================
 
 media_player:
   - platform: speaker
@@ -124,12 +177,27 @@ media_player:
       sample_rate: 48000
       num_channels: 2
 
-    # Conserva el archivo junto al YAML.
+    # Tono local de confirmación de la palabra de activación.
     files:
       - id: sonido_ok_nabu
         file: ok_nabu.flac
 
-    # Atenúa únicamente la música durante los anuncios.
+    # Diagnóstico: registra cambios del silencio del reproductor.
+    # No activa ni desactiva el silencio automáticamente.
+    on_mute:
+      - logger.log:
+          level: WARN
+          tag: audio_mute
+          format: "El reproductor ha activado el silencio"
+
+    on_unmute:
+      - logger.log:
+          level: INFO
+          tag: audio_mute
+          format: "El reproductor ha desactivado el silencio"
+
+    # Atenúa únicamente la ruta de música durante los anuncios.
+    # No modifica el estado mute ni el volumen principal.
     on_state:
       - if:
           condition:
@@ -146,8 +214,16 @@ media_player:
                 decibel_reduction: 0
                 duration: 1s
 
+# ============================================================
+# Estado de las animaciones del aro.
+# ============================================================
+
 globals:
-  # 0: reposo, 1: aviso, 2: escucha, 3: procesando, 4: respuesta.
+  # 0: reposo.
+  # 1: tono de activación.
+  # 2: escucha de la petición.
+  # 3: procesamiento de la petición.
+  # 4: reproducción de la respuesta.
   - id: fase_visual
     type: int
     restore_value: false
@@ -157,6 +233,10 @@ globals:
     type: int
     restore_value: false
     initial_value: '0'
+
+# ============================================================
+# Detección local de la palabra de activación.
+# ============================================================
 
 micro_wake_word:
   id: respeaker_wake_word
@@ -179,10 +259,14 @@ micro_wake_word:
         id: iniciar_interaccion
         palabra: !lambda return wake_word;
 
+# ============================================================
+# Scripts de iluminación e interacción.
+# ============================================================
+
 script:
   # Configuración común del aro.
   # Color RGB: #0078FF.
-  # El uint32 se transmite en orden little-endian.
+  # Los valores de color de 32 bits se envían en little-endian.
   - id: configurar_aro
     mode: restart
     parameters:
@@ -270,7 +354,7 @@ script:
 
             const int indice = 3 + led * 4;
 
-            // uint32 RGB en little-endian: B, G, R, 0.
+            // Color de 32 bits en little-endian: B, G, R, 0.
             trama[indice] = azul;
             trama[indice + 1] = verde;
             trama[indice + 2] = rojo;
@@ -317,7 +401,7 @@ script:
 
             - delay: 20ms
 
-  # Giro continuo durante la respuesta de Assist.
+  # Giro continuo durante la respuesta hablada de Assist.
   - id: giro_respuesta
     mode: restart
     then:
@@ -342,7 +426,8 @@ script:
 
             - delay: 70ms
 
-  # Tono, barrido y comienzo de una petición.
+  # Reproduce el tono, muestra el barrido e inicia una petición.
+  # No fuerza el volumen ni desactiva el silencio del reproductor.
   - id: iniciar_interaccion
     mode: single
     parameters:
@@ -360,13 +445,14 @@ script:
           media_file: sonido_ok_nabu
           announcement: true
 
-      # Evita esperar indefinidamente si falla el sonido.
+      # Limita la espera si el tono no llega a comenzar.
       - wait_until:
           condition:
             media_player.is_announcing:
               id: respeaker_media_player
           timeout: 2s
 
+      # Limita la espera a que termine el tono.
       - wait_until:
           condition:
             not:
@@ -393,7 +479,8 @@ script:
                 efecto: 0
                 brillo: 64
 
-  # Espera al final de la interacción y vuelve a escuchar.
+  # Espera al final de la interacción y de los anuncios.
+  # Después vuelve al estado visual de reposo y rearma Okay Nabu.
   - id: rearmar_palabra_activacion
     mode: restart
     then:
@@ -436,9 +523,12 @@ script:
           then:
             - micro_wake_word.start:
 
-# Detecta el comienzo de la respuesta hablada.
-# Sincroniza el interruptor virtual con el estado real del XVF3800.
+# ============================================================
+# Comprobaciones periódicas.
+# ============================================================
+
 interval:
+  # Inicia el giro cuando comienza el anuncio de la respuesta.
   - interval: 100ms
     then:
       - if:
@@ -451,11 +541,14 @@ interval:
             - lambda: id(fase_visual) = 4;
             - script.execute: giro_respuesta
 
+  # Lee el estado del silencio del micrófono en el XVF3800.
+  # Sincroniza la entidad con el botón físico y el control virtual.
+  # No modifica el silencio de la salida de audio.
   - interval: 1s
     then:
       - lambda: |-
           // GPO_READ_VALUES:
-          // cinco valores + un byte de estado.
+          // cinco valores más un byte de estado.
           const uint8_t solicitud[] = {
             0x14, 0x80, 0x06
           };
@@ -480,8 +573,7 @@ interval:
             return;
           }
 
-          // Estado 0 = respuesta válida.
-          // Si está pendiente o falla, conserva el último estado.
+          // Solo se publica el estado cuando la respuesta es válida.
           if (respuesta[0] != 0) {
             return;
           }
@@ -505,6 +597,12 @@ interval:
               silenciado ? "SILENCIADO" : "HABILITADO"
             );
           }
+
+# ============================================================
+# Assist.
+# La activación local la gestiona microWakeWord y el script
+# iniciar_interaccion; no se usa escucha continua de Assist.
+# ============================================================
 
 voice_assistant:
   id: respeaker_va
@@ -533,7 +631,7 @@ voice_assistant:
   on_start:
     - micro_wake_word.stop:
 
-  # Assist está preparado para recibir la orden.
+  # Assist está preparado para recibir la petición.
   on_listening:
     - script.stop: barrido_activacion
     - script.stop: giro_respuesta
@@ -545,7 +643,7 @@ voice_assistant:
         efecto: 4
         brillo: 64
 
-  # Ha terminado de detectar habla.
+  # Final de la voz detectada: comienza la fase de procesamiento.
   on_stt_vad_end:
     - lambda: id(fase_visual) = 3;
 
@@ -559,7 +657,7 @@ voice_assistant:
         format: "Assist ha reconocido: %s"
         args: ["x.c_str()"]
 
-  # Respaldo si el proveedor no envía on_stt_vad_end.
+  # Respaldo visual si no se recibe on_stt_vad_end.
   on_intent_start:
     - lambda: id(fase_visual) = 3;
 
@@ -579,15 +677,19 @@ voice_assistant:
 
     - script.execute: rearmar_palabra_activacion
 
+# ============================================================
+# Controles expuestos a Home Assistant.
+# La exposición a Assist se gestiona aparte en Home Assistant.
+# ============================================================
+
 button:
   - platform: restart
     name: "Restart"
 
-# Activación manual para pruebas.
-# No es un interruptor de privacidad.
 switch:
-  # Activación manual de Assist.
-  # No es un interruptor de privacidad del micrófono.
+  # Control manual de inicio/parada para pruebas.
+  # Su estado es optimista: no representa el estado real
+  # de la conversación ni el silencio del micrófono.
   - platform: template
     name: "Start Voice Assistant"
     id: start_voice_assistant
@@ -604,7 +706,9 @@ switch:
       - voice_assistant.stop:
       - script.execute: rearmar_palabra_activacion
 
-  # Estado real del silencio de la salida de audio.
+  # Silencio del reproductor: afecta a música, tono y respuestas.
+  # Lee el estado real; no es un interruptor de apagado del MAX98357A.
+  # No afecta a la captura del micrófono.
   - platform: template
     name: "Silenciar altavoz"
     id: silenciar_altavoz
@@ -621,8 +725,9 @@ switch:
       - media_player.unmute:
           id: respeaker_media_player
 
-  # Silencio del micrófono controlado por el propio XVF3800.
-  # El estado se publica desde la lectura periódica I2C.
+  # Silencio del micrófono controlado en el XVF3800.
+  # Su estado se publica desde el intervalo de lectura I2C.
+  # No afecta a la música ni al silencio del reproductor.
   - platform: template
     name: "Silenciar microfono"
     id: silenciar_microfono
